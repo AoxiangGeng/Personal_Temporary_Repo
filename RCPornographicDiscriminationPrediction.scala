@@ -119,8 +119,6 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val goddessUserIdDF = sql("SELECT user_id FROM rc_video_chat.rc_goddess")
     // 普通合作女用户
     val normalUserIdDF = sql("SELECT user_id FROM rc_video_chat.rc_temp_user")
-    // 用户的国家
-    val userCountryIdDF = userDF.select("target_user_id", "country_id")
 
     // 用户行为埋点表
     val userRequestLocationRecordDF = sql(
@@ -216,10 +214,10 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
      ***/
 
     // 产生标签函数（取决于用户近期视频截图中违规截图数占总截图数的比例，以及用户本身色情属性计算决定）
-    val getLabelUDF = udf((violations_count:Int, sexual_count:Int, snapshots_count:Int, user_eroticism:Int) =>
+    val getLabelUDF = udf((violations_count:Int, sexual_count:Int, snapshots_count:Int) =>
     {
       var res:Int = -1
-      var rate:Float = ( violations_count*2 + sexual_count*1 ) / ( snapshots_count*2 )
+      val rate: Float = (violations_count * 2 + sexual_count * 1) / (snapshots_count * 2)
       if(rate>0.5){
         res = 1
       }else{
@@ -228,12 +226,10 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     })
 
     // 产生标签
-    val labelDF = videoRecordDF.join(totalGirlsDF, "target_user_id")
-      //.withColumn("girl_country_id", getGirlCountryIdUDF($"target_user_id"))
-      //.filter($"girl_country_id" =!= 0)
-      .withColumn("label", getLabelUDF($"gender_condition", $"request_type", $"goddess_location", $"goddess_video", $"gender"))
+    val labelDF = videoRecordDF.join(userDF, "user_id")
+      .withColumn("label", getLabelUDF($"violations_count", $"sexual_count", $"snapshots_count"))
       .filter($"label" =!= -1)
-      .groupBy("user_id", "target_user_id").agg(max("label").as("label"))
+      .groupBy("user_id").agg(max("label").as("label"))
 
 
     /***
@@ -289,14 +285,14 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val model = lr.fit(trainDF)
     val test = model.transform(testDF)
 
-    //模型评估BinaryClassificationEvaluator
+    // 模型评估BinaryClassificationEvaluator
     val binaryClassificationEvaluator = new BinaryClassificationEvaluator()
       .setMetricName("areaUnderROC")
       .setRawPredictionCol("rawPrediction")
       .setLabelCol("label")
     val classificationMetric = binaryClassificationEvaluator.evaluate(test)
 
-    // 打印测绘结果
+    // 打印测试结果
     println(s"${binaryClassificationEvaluator.getMetricName} = $classificationMetric" +
       "\ncolumn count: " + data.head().getAs[Vector]("assembler").size +
       "\nfinal data label 0 count: " + data.filter(col("label") === 0).count() +
@@ -309,9 +305,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
 
 //    deleteFile(spark, lr_model_savepath, today, historyOffsetDay)
     model.save(lr_model_savepath + today)
-
-
-
+    println(s"Model has been saved to ${lr_model_savepath + today} !")
 
   }
 }
