@@ -38,7 +38,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     // 分桶数
     val quantileSize = 15
     // 模型保存路径
-    val lr_model_savepath = "/user/spark/recommend/PornographicDiscriminationPrediction/model"
+    val lr_model_model_path = "/user/spark/recommend/PornographicDiscriminationPrediction/model"
     // 自定义语言过滤函数
     val filterManyLanguageUDF = udf((languageId: String) => {
       var res = false
@@ -99,16 +99,12 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val boyAliveUserDF = aliveUserDF.filter($"gender" === 1)
     val girlAliveUserDF = aliveUserDF.filter($"gender" === 2).withColumnRenamed("user_id", "target_user_id")
 
-    val girlConfigDF = sql(s"""SELECT * FROM  rc_video_chat.rc_partner_level_price_config """.stripMargin)
-      .withColumnRenamed("id", "price_level_id_new").select("level", "price_level_id_new")
-    val goddessDF = sql(s"""SELECT * FROM  rc_video_chat.rc_goddess """.stripMargin)
-      .withColumnRenamed("user_id", "target_user_id")
+    val girlConfigDF = sql(s"""SELECT * FROM  rc_video_chat.rc_partner_level_price_config """.stripMargin).withColumnRenamed("id", "price_level_id_new").select("level", "price_level_id_new")
+    val goddessDF = sql(s"""SELECT * FROM  rc_video_chat.rc_goddess """.stripMargin).withColumnRenamed("user_id", "target_user_id")
     val goddessUserIdDF = goddessDF.select("target_user_id")
-    val normalDF = sql(s"""SELECT * FROM  rc_video_chat.rc_normal_group_user """.stripMargin)
-      .withColumnRenamed("user_id", "target_user_id")
+    val normalDF = sql(s"""SELECT * FROM  rc_video_chat.rc_normal_group_user """.stripMargin).withColumnRenamed("user_id", "target_user_id")
     val normalUserIdDF = normalDF.select("target_user_id")
-    val totalGirlsDF = goddessUserIdDF.union(normalUserIdDF)
-      .join(girlAliveUserDF, Seq("target_user_id")).distinct()
+    val totalGirlsDF = goddessUserIdDF.union(normalUserIdDF).join(girlAliveUserDF, Seq("target_user_id")).distinct()
     val totalGirlLevel = goddessDF.select("target_user_id", "price_level_id_new")
       .union(normalDF.select("target_user_id", "price_level_id_new"))
       .join(girlAliveUserDF, Seq("target_user_id"))
@@ -151,10 +147,10 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val convertUDF = udf((array: Seq[Float]) => {
       Vectors.dense(array.toArray.map(_.toDouble))
     })
-    val totalUserAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/userFeatures/" + today)
+    val totalUserAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/userFeatures/" + offsetDay)
       .withColumnRenamed("features", "boy_als_features")
       .withColumn("boy_als_features", convertUDF($"boy_als_features"))
-    val totalGirlAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/productFeatures/" + today)
+    val totalGirlAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/productFeatures/" + offsetDay)
       .withColumnRenamed("features", "girl_als_features")
       .withColumn("girl_als_features", convertUDF($"girl_als_features"))
 
@@ -223,25 +219,32 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     // 每个room_id对应的色情标签最小值，0：色情，1：性感，2：正常
     val roomDF = snapShotsDF.select("room_id","violations_label")
       .groupBy("room_id").agg(min("violations_label").as("violations"))
+      .na.drop()
 
     // 分别统计每个用户名下的截图中色情/性感/正常的数量
-    val violationDF = snapShotsDF.join(aliveUserDF,"user_id").filter($"violations_label" === 0)
-      .select("user_id").groupBy("user_id").agg(count("user_id").as("violations_quantile"))
-    val sexualDF = snapShotsDF.join(aliveUserDF,"user_id").filter($"violations_label" === 1)
-      .select("user_id").groupBy("user_id").agg(count("user_id").as("sexual_quantile"))
-    val otherDF = snapShotsDF.join(aliveUserDF,"user_id").filter($"violations_label" === 2)
-      .select("user_id").groupBy("user_id").agg(count("user_id").as("normal_quantile"))
+    val violationDF = snapShotsDF.join(aliveUserDF,Seq("user_id"),"left_outer").filter($"violations_label" === 0)
+      .select("user_id").groupBy("user_id").agg(count("user_id").as("violations_continuous"))
+    val sexualDF = snapShotsDF.join(aliveUserDF,Seq("user_id"),"left_outer").filter($"violations_label" === 1)
+      .select("user_id").groupBy("user_id").agg(count("user_id").as("sexual_continuous"))
+    val otherDF = snapShotsDF.join(aliveUserDF,Seq("user_id"),"left_outer").filter($"violations_label" === 2)
+      .select("user_id").groupBy("user_id").agg(count("user_id").as("normal_continuous"))
 
     // 产生标签函数
     val getLabelUDF = udf((violations:Int) =>
     {
-      val res = if(violations==0){1}else{0}
+      var res = -1
+      if(violations==0){
+        res = 1
+      }else{
+        res = 0
+      }
       res
     })
 
     // 产生标签
-    val labelDF = videoRecordDF.join(roomDF,"room_id").distinct()
+    val labelDF = videoRecordDF.join(roomDF,Seq("room_id"),"left_outer").distinct()
       .withColumn("label", getLabelUDF($"violations"))
+      .filter($"label" =!= -1)
       .groupBy("user_id","target_user_id").agg(max("label").as("label"))
 
     /***
@@ -254,9 +257,9 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       .join(sexualDF,Seq("user_id"),"left_outer")
       .join(otherDF,Seq("user_id"),"left_outer")
     val girlSumProfileDF = girlProfileDF.groupBy("target_user_id").sum(girlProfileDF.columns.filter(_ != "target_user_id"): _*)
-      .join(violationDF.withColumnRenamed("user_id","target_user_id"),Seq("target_user_id"),"left_outer")
-      .join(sexualDF.withColumnRenamed("user_id","target_user_id"),Seq("target_user_id"),"left_outer")
-      .join(otherDF.withColumnRenamed("user_id","target_user_id"),Seq("target_user_id"),"left_outer")
+      .join(violationDF.withColumnRenamed("user_id","target_user_id").withColumnRenamed("violations_continuous","girl_violations_continuous"),Seq("target_user_id"),"left_outer")
+      .join(sexualDF.withColumnRenamed("user_id","target_user_id").withColumnRenamed("sexual_continuous","girl_sexual_continuous"),Seq("target_user_id"),"left_outer")
+      .join(otherDF.withColumnRenamed("user_id","target_user_id").withColumnRenamed("normal_continuous","girl_normal_continuous"),Seq("target_user_id"),"left_outer")
     val boyToGirlSumProfileDF = boyToGirlProfileDF.groupBy("user_id", "target_user_id").sum(boyToGirlProfileDF.columns.filter(!_.contains("user_id")): _*)
 
     def fillNaWithVectorUDF = udf((vector: Vector, size: Int) => {
@@ -291,7 +294,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       Array(stringIndexer)
     })
 
-    // 连续值分桶成离散类别, 此类处理的特征以 _quantile结尾
+    // 连续值分桶成离散类别, 此类处理的特征以 _quantiles结尾
     val inputColumnsNames = resDF.columns.filter {
       _.contains("continuous")
     }
@@ -328,16 +331,17 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
 //      .fit(vectorAssemblerDF)
 
     // 划分features
-    val vectorNames = encodedDF.columns.filterNot(_.contains("user_id")).filterNot(_.contains("label"))
+//    val vectorNames = encodedDF.columns.filterNot(_.contains("user_id")).filterNot(_.contains("label")).filterNot(_.contains("target_user_id"))
+    val vectorInputColumnsNames = oneHotOutputColumnsNames++Array("boy_als_features","girl_als_features")
     val vectorAssembler = new VectorAssembler()
-      .setInputCols(vectorNames)
+      .setInputCols(vectorInputColumnsNames)
       .setOutputCol("featuresOut")
-      .setHandleInvalid("keep")
 
 //    val vectorAssemblerDF = vectorAssembler.setHandleInvalid("keep").transform(resDF)
 //    vectorAssemblerDF.printSchema()
 
-    val data = vectorAssembler.transform(encodedDF).select("user_id", "featuresOut", "label").cache()
+    val data = vectorAssembler.transform(encodedDF).drop(vectorInputColumnsNames: _*)
+      .select("user_id", "target_user_id","featuresOut", "label").cache()
 
 
 
@@ -379,9 +383,9 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
      * 模型持久化
      ***/
 
-    // deleteFile(spark, lr_model_savepath, today, historyOffsetDay)
-    model.save(lr_model_savepath + today)
-    println(s"Model has been saved to ${lr_model_savepath + today} !")
+    // deleteFile(spark, lr_model_model_path, today, historyOffsetDay)
+    model.save(lr_model_model_path + today)
+    println(s"Model has been saved to ${lr_model_model_path + today} !")
 
   }
 }
