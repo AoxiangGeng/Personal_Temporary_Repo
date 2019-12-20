@@ -29,16 +29,17 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
 
     // 最早提取截止日期
 //    val offsetDay = "2019-12-01"
-    val offset = -3
+    val recordDay = "2019-12-16"
+    val offset = args(0).toInt
     val offsetDay = getOffsetDay(offset)
     // 获取今日时间
     val today = getToday()
     val historyOffset = -180
     val historyOffsetDay = getOffsetDay(historyOffset)
     // 分桶数
-    val quantileSize = 15
+    val quantileSize = 10
     // 模型保存路径
-    val lr_model_model_path = "/user/spark/recommend/PornographicDiscriminationPrediction/model"
+    val lr_model_model_path = "s3://bigdata-rc/algorithm-data/recommend/PornographicDiscriminationPrediction/model"
     // 自定义语言过滤函数
     val filterManyLanguageUDF = udf((languageId: String) => {
       var res = false
@@ -90,12 +91,12 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
          |       room_id,
          |       dt
          |FROM rc_live_chat_statistics.rc_video_record
-         |where dt >= '${offsetDay}'""".stripMargin)
+         |where dt >= '${recordDay}'""".stripMargin)
 
     // 活跃用户
     val aliveUserDF = sql(
       s"""SELECT user_id
-         |FROM rc_live_chat_statistics.rc_user_record where dt='${offsetDay}'""".stripMargin)
+         |FROM rc_live_chat_statistics.rc_user_record where dt='${recordDay}'""".stripMargin)
     val boyAliveUserDF = aliveUserDF.filter($"gender" === 1)
     val girlAliveUserDF = aliveUserDF.filter($"gender" === 2).withColumnRenamed("user_id", "target_user_id")
 
@@ -141,22 +142,30 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       "girl_sign_eroticism_category",
       "girl_channel_category")
 
-    val boyProfilePath = (offset to -2).map("/user/spark/recommend/LogisticRegression/features/boy/" + getOffsetDay(_))
-    val girlProfilePath = (offset to -2).map("/user/spark/recommend/LogisticRegression/features/girl/" + getOffsetDay(_))
-    val boyToGirlProfilePath = (offset to -2).map("/user/spark/recommend/LogisticRegression/features/boyToGirl/" + getOffsetDay(_))
+    val boyProfilePath = (offset to -1).map("s3://bigdata-rc/algorithm-data/recommend/LogisticRegression/features/boy/" + getOffsetDay(_))
+    val girlProfilePath = (offset to -1).map("s3://bigdata-rc/algorithm-data/recommend/LogisticRegression/features/girl/" + getOffsetDay(_))
+    val boyToGirlProfilePath = (offset to -1).map("s3://bigdata-rc/algorithm-data/recommend/LogisticRegression/features/boyToGirl/" + getOffsetDay(_))
     val convertUDF = udf((array: Seq[Float]) => {
       Vectors.dense(array.toArray.map(_.toDouble))
     })
-    val totalUserAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/userFeatures/" + offsetDay)
+    val totalUserAlsDF = spark.sqlContext.read.parquet("s3://bigdata-rc/algorithm-data/recommend/ALS/userFeatures/" + today)
       .withColumnRenamed("features", "boy_als_features")
       .withColumn("boy_als_features", convertUDF($"boy_als_features"))
-    val totalGirlAlsDF = spark.sqlContext.read.parquet("/user/spark/recommend/ALS/productFeatures/" + offsetDay)
+    val totalGirlAlsDF = spark.sqlContext.read.parquet("s3://bigdata-rc/algorithm-data/recommend/ALS/productFeatures/" + today)
       .withColumnRenamed("features", "girl_als_features")
       .withColumn("girl_als_features", convertUDF($"girl_als_features"))
 
     val boyProfileDF = spark.sqlContext.read.parquet(boyProfilePath: _*)
     val girlProfileDF = spark.sqlContext.read.parquet(girlProfilePath: _*)
     val boyToGirlProfileDF = spark.sqlContext.read.parquet(boyToGirlProfilePath: _*)
+
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
+    println("文件读取完成")
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 产生标签
@@ -213,7 +222,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
          |location,
          |violations_label,
          |model
-         |FROM rc_live_chat_statistics.rc_video_snapshots where dt>='${offsetDay}'
+         |FROM rc_live_chat_statistics.rc_video_snapshots where dt>='${recordDay}'
               """.stripMargin)
 
     // 每个room_id对应的色情标签最小值，0：色情，1：性感，2：正常
@@ -242,10 +251,24 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     })
 
     // 产生标签
-    val labelDF = videoRecordDF.join(roomDF,Seq("room_id"),"left_outer").distinct()
+    val originLabelDF = videoRecordDF.join(roomDF,Seq("room_id"),"left_outer").distinct()
       .withColumn("label", getLabelUDF($"violations"))
       .filter($"label" =!= -1)
       .groupBy("user_id","target_user_id").agg(max("label").as("label"))
+      .na.fill(0)
+
+    // 对负样本进行欠采样
+    val negativeDF = originLabelDF.filter($"label" === 0).sample(true,0.01)
+    val positiveDF = originLabelDF.filter($"label" === 1)
+    val labelDF = negativeDF.union(positiveDF)
+
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
+    println("标签labelDF 生成！")
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 特征合并部分
@@ -280,17 +303,26 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
         .withColumn("boy_als_features", fillNaWithVectorUDF($"boy_als_features", lit(10)))
         .join(girlSumProfileDF, Seq("target_user_id"), "left_outer")
         .join(totalGirlAlsDF, Seq("target_user_id"), "left_outer")
+        .withColumn("girl_als_features", fillNaWithVectorUDF($"girl_als_features", lit(10)))
         .join(totalGirlLevel, Seq("target_user_id"), "left_outer")
         .join(userDF.toDF(girlProfileNames: _*), Seq("target_user_id"))
         .na.fill(0)
 
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
+    println("resDF 合并完成")
+    println(resDF.count())
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     // 字符类别特征转离散特征, 此类处理的特征以 _idx结尾
     val stringIndexerTransformers = resDF.columns.filter(_.contains("category")).flatMap((columnName: String) => {
       val stringIndexer = new StringIndexer()
         .setInputCol(columnName)
         .setOutputCol(s"${columnName}_idx")
-        .setHandleInvalid("keep")
+        .setHandleInvalid("skip")
       Array(stringIndexer)
     })
 
@@ -322,6 +354,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       .fit(featureTransformDF)
       .transform(featureTransformDF)
       .drop(oneHotInputColumnsNames: _*)
+      .na.fill(0)
 
 //    // 向量转规范的离散特征
 //    val featureIndexer = new VectorIndexer()
@@ -333,6 +366,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     // 划分features
 //    val vectorNames = encodedDF.columns.filterNot(_.contains("user_id")).filterNot(_.contains("label")).filterNot(_.contains("target_user_id"))
     val vectorInputColumnsNames = oneHotOutputColumnsNames++Array("boy_als_features","girl_als_features")
+//    val vectorInputColumnsNames = encodedDF.columns.filterNot(_.contains("user_id")).filterNot(_.contains("label")).filterNot(_.contains("target_user_id"))
     val vectorAssembler = new VectorAssembler()
       .setInputCols(vectorInputColumnsNames)
       .setOutputCol("featuresOut")
@@ -343,7 +377,13 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val data = vectorAssembler.transform(encodedDF).drop(vectorInputColumnsNames: _*)
       .select("user_id", "target_user_id","featuresOut", "label").cache()
 
-
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
+    println("data 合并完成")
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 模型训练
@@ -359,7 +399,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       .setFeaturesCol("featuresOut")
 
     // 将数据进行拆分。分为训练集和测试集
-    val Array(trainDF, testDF) = data.randomSplit(Array(0.8, 0.2))
+    val Array(trainDF, testDF) = data.randomSplit(Array(0.1, 0.9))
 
     // 训练并测试
     val model = lr.fit(trainDF)
@@ -373,11 +413,17 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
     val classificationMetric = binaryClassificationEvaluator.evaluate(test)
 
     // 打印测试结果
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
     println(s"${binaryClassificationEvaluator.getMetricName} = $classificationMetric" +
-      "\ncolumn count: " + data.head().getAs[Vector]("assembler").size +
+      "\ncolumn count: " + data.head().getAs[Vector]("featuresOut").size +
       "\nfinal data label 0 count: " + data.filter(col("label") === 0).count() +
       "\nfinal data label 1 count: " + data.filter(col("label") === 1).count()
     )
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 模型持久化
