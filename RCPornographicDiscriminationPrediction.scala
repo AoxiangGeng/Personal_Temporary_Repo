@@ -29,7 +29,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
 
     // 最早提取截止日期
 //    val offsetDay = "2019-12-01"
-    val recordDay = "2019-12-16"
+    val recordDay = "2019-12-01"
     val offset = args(0).toInt
     val offsetDay = getOffsetDay(offset)
     // 获取今日时间
@@ -258,8 +258,8 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       .na.fill(0)
 
     // 对负样本进行欠采样
-    val negativeDF = originLabelDF.filter($"label" === 0).sample(true,0.01)
-    val positiveDF = originLabelDF.filter($"label" === 1)
+    val negativeDF = originLabelDF.filter($"label" === 0).sample(true,0.2)
+    val positiveDF = originLabelDF.filter($"label" === 1).sample(true,10)
     val labelDF = negativeDF.union(positiveDF)
 
     println("*"*80)
@@ -399,7 +399,7 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
       .setFeaturesCol("featuresOut")
 
     // 将数据进行拆分。分为训练集和测试集
-    val Array(trainDF, testDF) = data.randomSplit(Array(0.1, 0.9))
+    val Array(trainDF, testDF) = data.randomSplit(Array(0.7, 0.3))
 
     // 训练并测试
     val model = lr.fit(trainDF)
@@ -430,7 +430,10 @@ object RCPornographicDiscriminationPrediction extends TaskSchedule{
      ***/
 
     // deleteFile(spark, lr_model_model_path, today, historyOffsetDay)
-    model.save(lr_model_model_path + today)
+    model.write.overwrite().save(lr_model_model_path + today)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
     println(s"Model has been saved to ${lr_model_model_path + today} !")
 
   }
