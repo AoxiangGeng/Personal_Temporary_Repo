@@ -29,7 +29,7 @@ object RCPornographicTolerance extends TaskSchedule{
 
     // 最早提取截止日期
     //    val offsetDay = "2019-12-01"
-    val recordDay = "2019-12-16"
+    val recordDay = "2019-12-01"
     val offset = args(0).toInt
     val offsetDay = getOffsetDay(offset)
     // 获取今日时间
@@ -232,7 +232,7 @@ object RCPornographicTolerance extends TaskSchedule{
 
     // 筛选除所有时长大于20秒的视频，并选取其对应的target_user_id和violations
     val allVideoViolationDF = videoRecordDF.join(roomDF,Seq("room_id"),"left_outer").distinct()
-      .filter($"video_time" >= 20).select("target_user_id","room_id","violations")
+      .filter($"video_time" >= 15).select("target_user_id","room_id","violations")
 
     //  统计用户名下所有时长大于20秒的违规的视频数和总视频数
     val longVideoViolationDF = allVideoViolationDF.filter($"violations" === 0).select("target_user_id")
@@ -244,20 +244,20 @@ object RCPornographicTolerance extends TaskSchedule{
     val getLabelUDF = udf((violation_video_sum:Int,total_video_sum:Int) =>
     {
       var res = -1
-      if(violation_video_sum/total_video_sum > 0.4){res = 1}else{res = 0}
+      if(violation_video_sum/total_video_sum > 0.35){res = 1}else{res = 0}
       res
     })
 
     // 产生标签
     val originLabelDF = longVideoViolationDF.join(totalVideoViolationDF,Seq("target_user_id"),"left_outer")
-      .withColumn("label", getLabelUDF($"sexual_video_sum",$"total_video_sum"))
+      .withColumn("label", getLabelUDF($"violation_video_sum",$"total_video_sum"))
       .filter($"label" =!= -1)
       .groupBy("target_user_id").agg(max("label").as("label"))
       .na.fill(0)
 
-    // 对负样本进行欠采样
-    val negativeDF = originLabelDF.filter($"label" === 0).sample(true,0.01)
-    val positiveDF = originLabelDF.filter($"label" === 1)
+    // 对正负样本分别进行不同程度的过采样
+    val negativeDF = originLabelDF.filter($"label" === 0).sample(true,5)
+    val positiveDF = originLabelDF.filter($"label" === 1).sample(true,20)
     val labelDF = negativeDF.union(positiveDF)
 
     println("*"*80)
@@ -371,9 +371,13 @@ object RCPornographicTolerance extends TaskSchedule{
     val data = vectorAssembler.transform(encodedDF).drop(vectorInputColumnsNames: _*)
       .select( "target_user_id","featuresOut", "label").cache()
 
-    println("*"*30)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
     println("data 合并完成")
-    println("*"*30)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 模型训练
@@ -389,7 +393,7 @@ object RCPornographicTolerance extends TaskSchedule{
       .setFeaturesCol("featuresOut")
 
     // 将数据进行拆分。分为训练集和测试集
-    val Array(trainDF, testDF) = data.randomSplit(Array(0.1, 0.9))
+    val Array(trainDF, testDF) = data.randomSplit(Array(0.7, 0.3))
 
     // 训练并测试
     val model = lr.fit(trainDF)
@@ -403,20 +407,27 @@ object RCPornographicTolerance extends TaskSchedule{
     val classificationMetric = binaryClassificationEvaluator.evaluate(test)
 
     // 打印测试结果
-    println("*"*30)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
     println(s"${binaryClassificationEvaluator.getMetricName} = $classificationMetric" +
       "\ncolumn count: " + data.head().getAs[Vector]("featuresOut").size +
       "\nfinal data label 0 count: " + data.filter(col("label") === 0).count() +
       "\nfinal data label 1 count: " + data.filter(col("label") === 1).count()
     )
-    println("*"*30)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
 
     /***
      * 模型持久化
      ***/
 
     // deleteFile(spark, lr_model_model_path, today, historyOffsetDay)
-    model.save(lr_model_model_path + today)
+    model.write.overwrite().save(lr_model_model_path + today)
+    println("*"*80)
+    println("*"*80)
+    println("*"*80)
     println(s"Model has been saved to ${lr_model_model_path + today} !")
 
   }
